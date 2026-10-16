@@ -1,0 +1,2 @@
+pyBigWig==0.3.26
+numpy>=2,<3
