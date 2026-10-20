@@ -1,0 +1,17 @@
+genome_cache/
+__pycache__/
+*.pyc
+*.fa
+*.fasta
+*.fna
+*.fa.gz
+*.fasta.gz
+*.fna.gz
+*.bw
+*.bigwig
+*.bed
+*.bedgraph
+*.csv
+*.svg
+data/
+results/

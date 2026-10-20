@@ -59,6 +59,28 @@
       xhr.send(file);
     });
   }
+  function useBigWig(data,name) {
+    dirty();state.bw={...data,name};
+    $("bw-info").textContent=`${name} · ${Object.keys(data.chroms).length}染色体`;
+    if(!$("sequence").value.trim()&&!state.reference){const [chrom,length]=Object.entries(data.chroms)[0];$("chrom").value=chrom;$("start").value=1;$("end").value=Math.min(length,10000);}
+    sync();
+  }
+  async function importChipAtlas() {
+    const accession=$("chip-atlas-id").value.trim().toUpperCase();
+    $("chip-atlas-id").value=accession;
+    if(!/^[SED]RX\d{6,12}$/.test(accession))throw new Error("SRX・ERX・DRXで始まる実験IDを入力してください（例: SRX000410）。");
+    const genome=$("genome-version").value;
+    if(genome==="custom")throw new Error("ChIP-Atlasから取得する場合は、対応する参照ゲノム版を選択してください。");
+    $("chip-atlas-status").textContent=`${accession}の${genome}版bigWigを取得しています…`;
+    notice("ChIP-AtlasからメタデータとbigWigを取得しています。ファイルサイズによって時間がかかります…");
+    const data=await api("/api/chip-atlas/import",{accession,genome});
+    const details=[data.antigen,data.cell_type].filter(value=>value&&value!=="NA"&&value!=="Unclassified"&&value!=="No description");
+    const name=[data.accession,...details].join(" · ");
+    useBigWig(data,name);
+    $("bw-label").value=data.antigen&&data.antigen!=="NA"?`${data.accession} ${data.antigen}`:data.accession;
+    $("chip-atlas-status").textContent=`取得済み · ${data.accession} · ${data.genome} · ${(data.bytes/1024**2).toFixed(1)} MB${data.title?` · ${data.title}`:""}`;
+    notice(`ChIP-Atlasから${data.accession}のbigWigを取得しました。解析方法と領域を選んで解析してください。`);
+  }
   async function run(task) {
     if(state.busy) return;
     state.busy=true; document.body.classList.add("busy");
@@ -71,9 +93,7 @@
   function buttons() {
     const valid=!!state.result && !state.stale && !state.busy;
     ["save-csv","save-bedgraph","save-bw-bedgraph","save-bed"].forEach(id=>$(id).disabled=!valid);
-    const figureDisabled=!state.svg || state.stale || state.busy;
-    document.querySelectorAll('#figure-export button').forEach(button=>button.disabled=figureDisabled);
-    if(figureDisabled) closeFigureFormats();
+    $("save-figure").disabled=!state.svg || state.stale || state.busy;
     $("save-guides").disabled=!state.guideResult?.hits.length || state.busy || !state.seq;
     $("table-prev").disabled=!valid || state.page===0;
     $("table-next").disabled=!valid || (state.page+1)*50>=tableData().rows.length;
@@ -92,7 +112,8 @@
     $("ref-optional").hidden=state.source!=="bigwig";
     $("motif-settings").hidden=state.source==="bigwig";
     $("paste-box").hidden=state.refmode!=="paste";
-    $("ref-file-box").hidden=state.refmode!=="file";
+    $("ref-file-box").hidden=state.refmode!=="file"||$("genome-version").value!=="custom";
+    $("genome-upload").hidden=$("genome-version").value!=="custom";
     $("location-box").hidden=state.refmode!=="paste";
     $("sliding-settings").hidden=state.mode!=="sliding";
     $("bin-settings").hidden=state.mode!=="bin";
@@ -105,7 +126,7 @@
     $("bw-window-settings").hidden=$("bw-mode").value!=="sliding";
     $("bw-bin-settings").hidden=$("bw-mode").value!=="bin";
     $("bw-bed-settings").hidden=$("bw-mode").value!=="bed";
-    $("coordinate-hint").textContent=state.refmode==="file" ? "FASTAの染色体名と表示領域を指定。BED集計は読み込んだ全参照を対象にします。" : state.source==="bigwig" && !$("sequence").value.trim() ? "bigWigの集計・表示領域を指定。gRNAを表示する場合はこの領域のDNA配列も入力します。" : "貼り付け配列の開始座標を指定します。終了位置は配列長から自動設定。";
+    $("coordinate-hint").textContent=state.refmode==="file" ? "参照ゲノムの染色体名と表示領域を指定。BED集計は全参照を対象にします。" : state.source==="bigwig" && !$("sequence").value.trim() ? "bigWigの集計・表示領域を指定。gRNAを表示する場合はこの領域のDNA配列も入力します。" : "貼り付け配列の開始座標を指定します。終了位置は配列長から自動設定。";
     for(const key of ["source","refmode","mode"]){document.querySelectorAll(`[data-${key}]`).forEach(b=>{b.classList.toggle("active",b.dataset[key]===state[key]);b.setAttribute("aria-pressed",String(b.dataset[key]===state[key]));});}
     const f=Number($("flank").value);
     $("window-description").textContent=Number.isSafeInteger(f)&&f>=1?`${fmt(f)} + 中心1 + ${fmt(f)} = ${fmt(2*f+1)} bp / window`:"片側の幅を1以上の整数で指定してください。";
@@ -120,7 +141,41 @@
     catch {$("sequence-length").textContent=$("sequence").value.trim()?"入力内容を解析時に検証します":"配列を入力してください";}
     sync();
   }
+  async function genomeCatalog() {
+    if(!state.server)return [];
+    const response=await fetch("/api/genomes"),data=await response.json();
+    if(!response.ok)throw new Error(data.error||"参照ゲノムの情報を取得できませんでした。");
+    return data.genomes;
+  }
+  function genomeStatus(entry) {
+    const names={available:"初回利用時に取得します",queued:"取得の順番を待っています",downloading:"ダウンロード中",verifying:"データを検証中",indexing:"検索用データを準備中",ready:"利用できます",error:"取得に失敗しました"};
+    const progress=entry.status==="downloading"&&entry.downloaded?` · ${fmt(Math.round(entry.downloaded/1024**2))} MB${entry.total?` / ${fmt(Math.round(entry.total/1024**2))} MB`:""}`:"";
+    return `${entry.name} · ${names[entry.status]||entry.status}${progress}${entry.error?` · ${entry.error}`:""}`;
+  }
+  async function ensureGenome() {
+    const assembly=$("genome-version").value;
+    if(assembly==="custom")return;
+    if(state.genome?.assembly===assembly&&state.reference?.assembly===assembly)return;
+    const name=$("genome-version").selectedOptions[0].textContent;
+    notice(`${name}を準備しています。初回の取得・索引作成には数分かかる場合があります。`);
+    let data=await api("/api/genomes/select",{assembly});
+    while(data.status!=="ready"){
+      $("genome-status").textContent=genomeStatus(data);
+      if(data.status==="error")throw new Error(data.error||"参照ゲノムの準備に失敗しました。もう一度実行してください。");
+      await new Promise(resolve=>setTimeout(resolve,1500));
+      const catalog=await genomeCatalog();
+      data=catalog.find(entry=>entry.assembly===assembly);
+      if(!data)throw new Error("選択した参照ゲノムが見つかりません。");
+      if(data.status==="ready")data=await api("/api/genomes/select",{assembly});
+    }
+    state.genome={...data,name:data.name};state.reference=state.genome;
+    $("genome-status").textContent=genomeStatus(data);
+    $("genome-info").textContent=`${data.name} · ${Object.keys(data.chroms).length}配列`;
+    $("ref-info").textContent=data.name;
+    updateChroms();
+  }
   async function getSequence(required=true) {
+    if(state.refmode==="file")await ensureGenome();
     const r=region();
     if(state.refmode==="paste"){
       if(!$("sequence").value.trim()&&!required)return null;
@@ -139,6 +194,7 @@
     return {...r,sequence:data.sequence};
   }
   async function analyze() {
+    if(state.refmode==="file"&&state.source!=="bigwig")await ensureGenome();
     notice("解析しています…");
     if(state.source==="overlay"&&!state.bw)throw new Error("重ねて表示するbigWigファイルを読み込んでください。");
     const motif=state.source!=="bigwig"?C.motifPattern($("motif").value):null;
@@ -185,7 +241,7 @@
     }
     state.seq=seq;state.scan=scan;state.scanMotif=motif;state.guideResult=null;state.seqPage=0;
     const mapping=state.refmode==="paste"&&state.location&&state.location.query===$("sequence").value.split(/\r?\n/).filter(line=>!line.trim().startsWith(">")).join("").replace(/\s/g,"").toUpperCase()&&state.location.chrom===(seq||r).chrom&&state.location.start===(seq||r).start?state.location:null;
-    state.result={rows,bwRows,bwConfig,bin_size:state.source==="bigwig"?bwConfig.bin_size:bin_size,independent:state.source==="overlay"&&separate,source:state.source,mode:state.source==="bigwig"?bwConfig.mode:state.mode,motif,both,flank:state.source==="bigwig"?bwConfig.flank:flank,step:state.source==="bigwig"?bwConfig.step:step,region:seq||r,bwName:state.source==="sequence"?null:state.bw.name,mapping};
+    state.result={assembly:$("genome-version").value==="custom"?null:$("genome-version").value,rows,bwRows,bwConfig,bin_size:state.source==="bigwig"?bwConfig.bin_size:bin_size,independent:state.source==="overlay"&&separate,source:state.source,mode:state.source==="bigwig"?bwConfig.mode:state.mode,motif,both,flank:state.source==="bigwig"?bwConfig.flank:flank,step:state.source==="bigwig"?bwConfig.step:step,region:seq||r,bwName:state.source==="sequence"?null:state.bw.name,mapping};
     state.stale=false;state.page=0;
     state.tableTrack="motif";
     const available=[...new Set([...rows,...(bwRows||[])].map(row=>row.chrom))];
@@ -212,8 +268,10 @@
     if($("guides").value.trim())await markGuides();
   }
   async function locate(){
-    if(!state.genome)throw new Error("検索する配列とは別に、検索用の参照ゲノムFASTAを読み込んでください。");
     const query=C.parseSequence($("sequence").value);
+    if(query.length<20)throw new Error("位置検索には20 bp以上の配列を入力してください。");
+    await ensureGenome();
+    if(!state.genome)throw new Error("「自分のFASTAを使用」では検索用参照FASTAを読み込んでください。");
     notice("参照ゲノム内を検索しています…大きなゲノムでは時間がかかります。");
     const data=await api("/api/reference/search",{id:state.genome.id,query,max_edits:1});
     state.locationCandidates=data.matches.map(match=>({...match,query}));
@@ -255,6 +313,7 @@
     $("metric-three-unit").textContent="regions";$("metric-four").textContent="—";
     refreshFigureLabels(result);
     $("chart-subtitle").textContent=result.independent?`モチーフ: ${configText(result)} ／ ${bwDisplayName()}: ${configText(result.bwConfig)}`:configText(result);
+    if(result.assembly)$("chart-subtitle").textContent+=` · 参照ゲノム: ${result.assembly}`;
     if(result.mapping?.edits)$("chart-subtitle").textContent+=" · 入力と1塩基差あり／参照ゲノム配列で解析";
     $("bw-legend").hidden=!overlay;
     $("save-bw-bedgraph").hidden=!overlay;
@@ -350,6 +409,7 @@
     const H=Math.max(430,guideTop+Math.max(0,laneEnds.length-1)*46+82);
     const chroms=[...new Set(result?[...result.rows,...(result.bwRows||[])].map(r=>r.chrom):[chrom])];
     let svg=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(chrom)}の${esc(overlay?'モチーフ密度と'+bwLabel+'スコアの重ね合わせ':source==='bigwig'?bwLabel+'平均信号':'モチーフ密度')}とgRNA位置"><desc>${overlay?'緑実線は左軸のモチーフ密度、紫破線は右軸の'+esc(bwLabel)+'平均スコア。左右の軸は別スケール。':''}欠測は0にせず線を切ります。</desc><rect width="${W}" height="${H}" fill="white"/><defs><clipPath id="plot-clip"><rect x="${L}" y="${T}" width="${W-L-R}" height="${B-T}"/></clipPath></defs>`;
+    if(result?.assembly)svg+=`<text x="${L}" y="${H-43}" fill="#718488" font-size="10" font-family="sans-serif">Reference genome: ${esc(result.assembly)}</text>`;
     svg+=`<line x1="${L}" x2="${L+22}" y1="15" y2="15" stroke="${primary.color}" stroke-width="2"/><text x="${L+29}" y="19" fill="${primary.color}" font-size="11" font-family="sans-serif">${esc(overlay?'Motif density (left)':primary.label)}</text>`;
     if(secondary)svg+=`<line x1="${L+230}" x2="${L+252}" y1="15" y2="15" stroke="${secondary.color}" stroke-width="2" stroke-dasharray="6 3"/><text x="${L+259}" y="19" fill="${secondary.color}" font-size="11" font-family="sans-serif">${esc(bwLabel)} score (right)</text>`;
     if(result?.independent){const brief=c=>c.mode==='raw'?'stored values (no smoothing)':c.mode==='bed'?'BED':c.mode==='bin'?`${c.bin_size} bp bins (last bin clipped)`:`${2*c.flank+1} bp window / ${c.step} bp step`;svg+=`<text x="${L}" y="34" fill="#718488" font-size="10" font-family="sans-serif">Motif: ${brief(result)} | ${esc(bwLabel)}: ${brief(result.bwConfig)}</text>`;}
@@ -406,38 +466,28 @@
     buttons();
   }
   function download(text, filename, type="text/plain;charset=utf-8") {
-    const url=URL.createObjectURL(text instanceof Blob?text:new Blob([text],{type}));const a=document.createElement("a");a.href=url;a.download=filename;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);
+    downloadBlob(new Blob([text],{type}),filename);
   }
-
-  async function savePng() {
-    if(!state.svg || state.stale) return;
-    const svg=new DOMParser().parseFromString(state.svg,"image/svg+xml").documentElement;
-    const [, , width, height]=svg.getAttribute("viewBox").trim().split(/\s+/).map(Number);
-    const scale=2;
-    svg.setAttribute("width",width);
-    svg.setAttribute("height",height);
-    const url=URL.createObjectURL(new Blob([new XMLSerializer().serializeToString(svg)],{type:"image/svg+xml;charset=utf-8"}));
+  function downloadBlob(blob,filename) {
+    const url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=filename;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);
+  }
+  async function saveFigure() {
+    if(!state.svg||state.stale)return;
+    if($("figure-format").value==="svg"){download(state.svg,"motif_analysis.svg","image/svg+xml;charset=utf-8");return;}
+    const viewBox=state.svg.match(/viewBox="[\d.-]+ [\d.-]+ ([\d.]+) ([\d.]+)"/);
+    if(!viewBox)throw new Error("図の大きさを取得できませんでした。");
+    const width=Number(viewBox[1]),height=Number(viewBox[2]),scale=2;
+    const source=URL.createObjectURL(new Blob([state.svg],{type:"image/svg+xml;charset=utf-8"}));
     try {
       const image=new Image();
-      await new Promise((resolve,reject)=>{
-        image.onload=resolve;
-        image.onerror=()=>reject(new Error("PNG用の図を読み込めませんでした。もう一度保存してください。"));
-        image.src=url;
-      });
-      const canvas=document.createElement("canvas");
-      canvas.width=Math.round(width*scale);
-      canvas.height=Math.round(height*scale);
-      const context=canvas.getContext("2d");
-      if(!context) throw new Error("このブラウザーではPNG画像を作成できません。");
-      context.fillStyle="#fff";
-      context.fillRect(0,0,canvas.width,canvas.height);
-      context.drawImage(image,0,0,canvas.width,canvas.height);
+      await new Promise((resolve,reject)=>{image.onload=resolve;image.onerror=()=>reject(new Error("PNG用の図を作成できませんでした。"));image.src=source;});
+      const canvas=document.createElement("canvas");canvas.width=Math.round(width*scale);canvas.height=Math.round(height*scale);
+      const context=canvas.getContext("2d");if(!context)throw new Error("このブラウザではPNGを作成できません。");
+      context.fillStyle="#ffffff";context.fillRect(0,0,canvas.width,canvas.height);context.drawImage(image,0,0,canvas.width,canvas.height);
       const blob=await new Promise(resolve=>canvas.toBlob(resolve,"image/png"));
-      if(!blob) throw new Error("PNG画像を作成できませんでした。もう一度保存してください。");
-      download(blob,"Motif Analysis.png");
-    } finally {
-      URL.revokeObjectURL(url);
-    }
+      if(!blob)throw new Error("PNGの変換に失敗しました。");
+      downloadBlob(blob,"motif_analysis.png");
+    } finally {URL.revokeObjectURL(source);}
   }
   function safeName(name){return String(name).replace(/[^a-zA-Z0-9_.-]/g,"_").slice(0,80)||"result";}
   function exportResults(kind) {
@@ -449,17 +499,17 @@
     const field=useBwRows?"mean":bwTrack?"bw_mean":result.source!=="bigwig"?"density":"mean";
     const base=`${safeName(useBwRows||bwTrack?"bigwig":result.motif||"bigwig")}_${config.mode}`;
     if(kind==="csv"){
-      const keys=[...(result.mode==="bin"?["bin_bp","interval_bp"]:[]),"chrom","start","end","name","center",...(result.source!=="bigwig"?["count","density"]:["mean","minimum","maximum","coverage"]),"status",...(overlay?["bw_mean","bw_minimum","bw_maximum","bw_coverage","bw_status"]:[]),...(result.mapping?["sequence_basis","query_difference","query_strand"]:[])];
+      const keys=["assembly",...(result.mode==="bin"?["bin_bp","interval_bp"]:[]),"chrom","start","end","name","center",...(result.source!=="bigwig"?["count","density"]:["mean","minimum","maximum","coverage"]),"status",...(overlay?["bw_mean","bw_minimum","bw_maximum","bw_coverage","bw_status"]:[]),...(result.mapping?["sequence_basis","query_difference","query_strand"]:[])];
       const csvCell=value=>'"'+String(value??"").replace(/"/g,'""')+'"';
       const userCell=value=>/^[=+\-@\t\r]/.test(String(value))?"'"+value:value;
       if(result.independent){
-        const columns=["track","track_label","chrom","start_0based","end_exclusive","center_0based","name","method","flank_bp","step_bp",...([result.mode,result.bwConfig.mode].includes("bin")?["bin_bp","interval_bp"]:[]),"count","density","mean","minimum","maximum","coverage","status","sequence_basis","query_difference","query_strand"];
+        const columns=["assembly","track","track_label","chrom","start_0based","end_exclusive","center_0based","name","method","flank_bp","step_bp",...([result.mode,result.bwConfig.mode].includes("bin")?["bin_bp","interval_bp"]:[]),"count","density","mean","minimum","maximum","coverage","status","sequence_basis","query_difference","query_strand"];
         const lines=[columns.join(",")];
-        for(const [track,list,cfg] of [["motif",result.rows,result],["bigwig",result.bwRows,result.bwConfig]])for(const row of list){const data={...row,track,track_label:track==="motif"?result.motif:bwDisplayName(),start_0based:row.start,end_exclusive:row.end,center_0based:row.center,method:cfg.mode,flank_bp:cfg.mode==="sliding"?cfg.flank:null,step_bp:cfg.mode==="sliding"?cfg.step:null,bin_bp:cfg.mode==="bin"?cfg.bin_size:null,interval_bp:row.end-row.start,sequence_basis:track==="bigwig"?"stored_bigwig":result.mapping?.edits?"reference_genome":"query_genomic_forward",query_difference:result.mapping?.difference,query_strand:result.mapping?.strand};lines.push(columns.map(key=>csvCell(["name","chrom","track_label"].includes(key)?userCell(data[key]):data[key])).join(","));}
+        for(const [track,list,cfg] of [["motif",result.rows,result],["bigwig",result.bwRows,result.bwConfig]])for(const row of list){const data={...row,assembly:result.assembly,track,track_label:track==="motif"?result.motif:bwDisplayName(),start_0based:row.start,end_exclusive:row.end,center_0based:row.center,method:cfg.mode,flank_bp:cfg.mode==="sliding"?cfg.flank:null,step_bp:cfg.mode==="sliding"?cfg.step:null,bin_bp:cfg.mode==="bin"?cfg.bin_size:null,interval_bp:row.end-row.start,sequence_basis:track==="bigwig"?"stored_bigwig":result.mapping?.edits?"reference_genome":"query_genomic_forward",query_difference:result.mapping?.difference,query_strand:result.mapping?.strand};lines.push(columns.map(key=>csvCell(["name","chrom","track_label"].includes(key)?userCell(data[key]):data[key])).join(","));}
         download("\uFEFF"+lines.join("\r\n"),`${safeName(result.motif)}_and_bigwig_independent.csv`,"text/csv;charset=utf-8");return;
       }
       const lines=[keys.map(k=>k==="start"?"start_0based":k==="end"?"end_exclusive":k==="center"?"center_0based":k).join(",")];
-      for(const row of result.rows){const data={...row,bin_bp:result.bin_size,interval_bp:row.end-row.start,sequence_basis:result.mapping?.edits?"reference_genome":"query_genomic_forward",query_difference:result.mapping?.difference,query_strand:result.mapping?.strand};lines.push(keys.map(k=>csvCell(["name","chrom"].includes(k)?userCell(data[k]):data[k])).join(","));}
+      for(const row of result.rows){const data={...row,assembly:result.assembly,bin_bp:result.bin_size,interval_bp:row.end-row.start,sequence_basis:result.mapping?.edits?"reference_genome":"query_genomic_forward",query_difference:result.mapping?.difference,query_strand:result.mapping?.strand};lines.push(keys.map(k=>csvCell(["name","chrom"].includes(k)?userCell(data[k]):data[k])).join(","));}
       download("\uFEFF"+lines.join("\r\n"),base+".csv","text/csv;charset=utf-8");return;
     }
     const rows=sourceRows.filter(r=>kind==="bed"?r.status==="ok"||(!result.independent&&overlay&&r.bw_status==="ok"):r[useBwRows?"status":bwTrack?"bw_status":"status"]==="ok"&&Number.isFinite(r[field])).slice().sort((a,b)=>a.chrom.localeCompare(b.chrom)||a.start-b.start||a.end-b.end);
@@ -488,6 +538,16 @@
     if(state.result&&!state.stale)refreshFigureLabels(state.result);
     if(!state.stale)renderChart();
   });
+  $("genome-version").addEventListener("change",()=>run(async()=>{
+    if(state.bw?.genome&&state.bw.genome!==$("genome-version").value){state.bw=null;$("bw-info").textContent="ゲノム版が変わったためbigWigを読み込み直してください。";$("chip-atlas-status").textContent="選択中のゲノム版に対応するChIP/ATAC/DNase-seqのbigWigを取得します。";}
+    state.genome=null;state.reference=null;state.location=null;state.locationCandidates=[];
+    $("location-results").hidden=true;$("genome-file").value="";$("ref-file").value="";
+    $("genome-info").textContent="";$("ref-info").textContent="ファイル未選択";
+    $("location-status").textContent="参照ゲノムが変更されました。もう一度検索してください。";
+    dirty(true);sync();
+    if($("genome-version").value==="custom"){$("genome-status").textContent="検索用または領域解析用の参照FASTAを指定してください。";notice("自分のFASTAを使用します。");}
+    else {await ensureGenome();notice("参照ゲノムを選択しました。配列の自動検索または領域解析を実行できます。");}
+  }));
   $("locate").addEventListener("click",()=>run(locate));
   $("apply-location").addEventListener("click",()=>run(async()=>{const match=state.locationCandidates[Number($("location-match").value)];if(!match)throw new Error("検索をやり直してください。");await applyLocation(match,match.query);}));
   $("query-file").addEventListener("change",()=>run(async()=>{const file=$("query-file").files[0];if(!file)return;if(file.size>5*1024**2)throw new Error("検索配列ファイルは5 MB以下にしてください。");const text=await file.text();C.parseSequence(text);$("sequence").value=text;state.location=null;dirty(true);pasteLength();notice("検索する配列を読み込みました。参照ゲノムを指定して自動検索できます。");}));
@@ -504,62 +564,22 @@
   $("cpg-preset").addEventListener("click",()=>{$("motif").value="CG";state.scan=null;state.scanMotif=null;dirty();if(state.seq)renderSequence();});
   $("bed-file").addEventListener("change",()=>run(async()=>{const file=$("bed-file").files[0];if(!file)return;if(file.size>20*1024**2)throw new Error("BEDは20 MB以下にしてください。");$("bed-text").value=await file.text();dirty();C.parseBed($("bed-text").value);notice(`${file.name} を読み込みました。「解析する」で集計してください。`);}));
   $("ref-file").addEventListener("change",()=>run(async()=>{const file=$("ref-file").files[0];if(!file)return;dirty(true);state.reference=null;const data=await upload("/api/reference",file);state.reference={...data,name:file.name};const [chrom,length]=Object.entries(data.chroms)[0];$("chrom").value=chrom;$("start").value=1;$("end").value=Math.min(length,10000);$("ref-info").textContent=`${file.name} · ${Object.keys(data.chroms).length}配列 · ${fmt(Object.values(data.chroms).reduce((a,b)=>a+b,0))} bp`;sync();notice("参照FASTAを読み込みました。表示領域を指定して解析してください。BED集計は全参照を対象にできます。");}));
-  $("bw-file").addEventListener("change",()=>run(async()=>{const file=$("bw-file").files[0];if(!file)return;dirty();state.bw=null;const data=await upload("/api/bigwig",file);state.bw={...data,name:file.name};$("bw-info").textContent=`${file.name} · ${Object.keys(data.chroms).length}染色体`;if(!$("sequence").value.trim()&&!state.reference){const [chrom,length]=Object.entries(data.chroms)[0];$("chrom").value=chrom;$("start").value=1;$("end").value=Math.min(length,10000);}sync();notice("bigWigを読み込みました。解析方法と領域を選んで解析してください。");}));
+  $("chip-atlas-fetch").addEventListener("click",()=>run(importChipAtlas));
+  $("chip-atlas-id").addEventListener("keydown",event=>{if(event.key==="Enter"){event.preventDefault();run(importChipAtlas);}});
+  $("bw-file").addEventListener("change",()=>run(async()=>{const file=$("bw-file").files[0];if(!file)return;state.bw=null;const data=await upload("/api/bigwig",file);useBigWig(data,file.name);$("chip-atlas-status").textContent="選択中のゲノム版に対応するChIP/ATAC/DNase-seqのbigWigを取得します。";notice("bigWigを読み込みました。解析方法と領域を選んで解析してください。");}));
   $("save-csv").addEventListener("click",()=>exportResults("csv"));$("save-bedgraph").addEventListener("click",()=>exportResults("bedgraph"));$("save-bed").addEventListener("click",()=>exportResults("bed"));
   $("save-bw-bedgraph").addEventListener("click",()=>exportResults("bw-bedgraph"));
-  let figureFormat="svg";
-  function closeFigureFormats() {
-    $("figure-format-options").hidden=true;
-    $("figure-format-toggle").setAttribute("aria-expanded","false");
-  }
-  function openFigureFormats() {
-    $("figure-format-options").hidden=false;
-    $("figure-format-toggle").setAttribute("aria-expanded","true");
-  }
-  $("save-figure").addEventListener("click",()=>{
-    closeFigureFormats();
-    if(!state.svg || state.stale || state.busy) return;
-    if(figureFormat==="png") run(savePng);
-    else download(state.svg,"Motif Analysis.svg","image/svg+xml");
-  });
-  $("figure-format-toggle").addEventListener("click",()=>{
-    if($("figure-format-options").hidden) openFigureFormats();
-    else closeFigureFormats();
-  });
-  $("figure-format-toggle").addEventListener("keydown",event=>{
-    if(event.key!=="ArrowDown") return;
-    event.preventDefault();
-    openFigureFormats();
-    document.querySelector(`[data-figure-format="${figureFormat}"]`).focus();
-  });
-  document.querySelectorAll("[data-figure-format]").forEach(button=>button.addEventListener("click",()=>{
-    figureFormat=button.dataset.figureFormat;
-    $("save-figure").textContent=figureFormat.toUpperCase()+"保存 ↓";
-    document.querySelectorAll("[data-figure-format]").forEach(option=>option.setAttribute("aria-pressed",String(option===button)));
-    closeFigureFormats();
-    $("save-figure").focus();
-  }));
-  $("figure-export").addEventListener("keydown",event=>{
-    if(event.key!=="Escape") return;
-    closeFigureFormats();
-    $("figure-format-toggle").focus();
-  });
-  $("figure-export").addEventListener("focusout",event=>{
-    if(!$("figure-export").contains(event.relatedTarget)) closeFigureFormats();
-  });
-  document.addEventListener("click",event=>{
-    if(!$("figure-export").contains(event.target)) closeFigureFormats();
-  });
+  $("save-figure").addEventListener("click",()=>run(saveFigure));
   $("save-guides").addEventListener("click",()=>{if(state.guideResult&&state.seq)download(state.guideResult.hits.map(h=>[state.seq.chrom,h.start,h.end,safeName(h.name),0,h.strand].join("\t")).join("\n")+"\n","gRNA_matches.bed");});
   $("table-prev").addEventListener("click",()=>{state.page--;renderTable();});$("table-next").addEventListener("click",()=>{state.page++;renderTable();});
   $("seq-prev").addEventListener("click",()=>{state.seqPage--;renderSequence();});$("seq-next").addEventListener("click",()=>{state.seqPage++;renderSequence();});
   try{$("bw-label").value=localStorage.getItem("motifStudio.bwLabel")||"bigWig";}catch{}
   sync();
-  if(location.protocol==="http:"||location.protocol==="https:")fetch("/api/health").then(r=>r.json()).then(data=>{state.server=true;restoreStartup(data.startup);$("connection").textContent=data.bigwig?"● ローカル接続":"● 配列解析のみ";$("connection").classList.add("connected");if(!data.bigwig)notice("bigWigを使用する場合は、サーバーの環境に requirements.txt の依存関係をインストールしてください。","warn");}).catch(()=>offline());else offline();
+  if(location.protocol==="http:"||location.protocol==="https:")fetch("/api/health").then(r=>r.json()).then(data=>{state.server=true;$("session-info").hidden=false;restoreStartup(data.startup);genomeCatalog().then(entries=>{const entry=entries.find(e=>e.assembly===$("genome-version").value);if(entry)$("genome-status").textContent=genomeStatus(entry);}).catch(e=>notice(e.message,"warn"));$("connection").textContent=data.bigwig?"● ローカル接続":"● 配列解析のみ";$("connection").classList.add("connected");if(!data.bigwig)notice("bigWigを使用する場合は、サーバーの環境に requirements.txt の依存関係をインストールしてください。","warn");}).catch(()=>offline());else offline();
   function offline(){$("connection").textContent="HTMLモード";notice("配列の貼り付け解析を使用できます。全ゲノムFASTA・bigWigを扱う場合はローカルサーバーを起動してください。","warn");}
   function restoreStartup(data){
     if(!data||$("sequence").value.trim())return;
-    if(data.genome){state.genome=data.genome;$("genome-info").textContent=data.genome.name;}
+    if(data.genome){$("genome-version").value="custom";$("genome-status").textContent="起動時に指定した参照FASTAを使用します。";state.genome=data.genome;$("genome-info").textContent=data.genome.name;}
     if(data.bw){state.bw=data.bw;$("bw-info").textContent=`${data.bw.name} · ${Object.keys(data.bw.chroms).length}染色体`;state.source="overlay";}
     if(data.query)$("sequence").value=data.query;
     pasteLength();
