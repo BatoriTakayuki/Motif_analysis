@@ -356,7 +356,7 @@ class Store:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "MotifWorkbench/1.0"
+    server_version = "MotifAnalysis/1.0"
 
     def setup(self):
         super().setup()
@@ -543,14 +543,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ローカル配列・bigWig解析ツール")
+    parser = argparse.ArgumentParser(description="Motif Analysis — ローカル配列・bigWig解析ツール")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--search-genome", type=Path, help="起動時に読み込む検索用参照FASTA")
     parser.add_argument("--query", type=Path, help="起動時に画面へ入力する単一配列FASTA")
     parser.add_argument("--bigwig", type=Path, help="起動時に読み込むbigWig")
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="motif-workbench-") as directory:
+    with tempfile.TemporaryDirectory(prefix="motif-analysis-") as directory:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.allowed_hosts = {"localhost", "127.0.0.1", "::1"}
         if args.host not in ("0.0.0.0", "::"):
@@ -575,7 +575,7 @@ def main():
                 sizes = bw.chroms()
             server.store.bigwigs[token] = args.bigwig
             server.startup["bw"] = dict(id=token, chroms=sizes, name=args.bigwig.name)
-        print(f"ブラウザで http://localhost:{args.port} を開いてください。終了: Ctrl+C", flush=True)
+        print(f"Motif Analysis: ブラウザで http://localhost:{args.port} を開いてください。終了: Ctrl+C", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
