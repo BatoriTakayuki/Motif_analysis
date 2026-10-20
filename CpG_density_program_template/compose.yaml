@@ -1,0 +1,20 @@
+services:
+  motif-studio:
+    build: .
+    image: motif-studio
+    container_name: motif-studio
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${MOTIF_HOST_IP:-10.40.3.211}:8765:8765"
+    volumes:
+      - ./genome_cache:/data/genomes
+    command:
+      - python
+      - server.py
+      - --host
+      - 0.0.0.0
+      - --allowed-host
+      - "${MOTIF_HOST_IP:-10.40.3.211}"
+      - --genome-cache
+      - /data/genomes

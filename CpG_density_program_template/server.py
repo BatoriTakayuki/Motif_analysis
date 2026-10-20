@@ -1,19 +1,29 @@
-"""Local, dependency-light DNA / BED / bigWig workbench. No remote services."""
+"""Local DNA / BED / bigWig workbench, with cached public reference genomes."""
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import OrderedDict
+from contextlib import contextmanager
 import gzip
+import hashlib
 import heapq
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie, CookieError
 import json
 import math
 from pathlib import Path
 import re
+import secrets
+import shutil
 import tempfile
 import threading
+import time
 import uuid
 from urllib.parse import urlsplit
+from urllib.parse import urlencode
+from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
 
 ROOT = Path(__file__).resolve().parent
 MAX_REGION = 2_000_000
@@ -21,6 +31,15 @@ MAX_ROWS = 100_000
 MAX_BED_BASES = 50_000_000
 MAX_UPLOAD = 20 * 1024**3
 MAX_JSON = 20 * 1024**2
+SESSION_COOKIE = "motif_session"
+SESSION_TTL = 24 * 60 * 60
+GENOME_CATALOG = {
+    "mm10": {"name": "マウス GRCm38（mm10）", "source": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/"},
+    "mm39": {"name": "マウス GRCm39（mm39）", "source": "https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/"},
+}
+CHIP_ATLAS_METADATA = "https://chip-atlas.org/data/exp_metadata.json"
+CHIP_ATLAS_DATA = "https://chip-atlas.dbcls.jp/data"
+CHIP_ATLAS_HOSTS = {"chip-atlas.org", "chip-atlas.dbcls.jp"}
 IUPAC = dict(A="A", C="C", G="G", T="T", R="AG", Y="CT", S="CG", W="AT", K="GT", M="AC", B="CGT", D="AGT", H="ACT", V="ACG", N="ACGT")
 COMPLEMENT = str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN")
 
@@ -29,6 +48,112 @@ def integer(value, name, minimum=0, maximum=2**53 - 1):
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise ValueError(f"{name}: {minimum}〜{maximum}の整数を指定してください。")
     return value
+
+
+def chip_atlas_accession(value):
+    accession = str(value or "").strip().upper()
+    if not re.fullmatch(r"[SED]RX\d{6,12}", accession):
+        raise ValueError("ChIP-Atlas IDはSRX・ERX・DRXで始まる実験IDを指定してください（例: SRX000410）。")
+    return accession
+
+
+def trusted_response(response, hosts):
+    final = urlsplit(response.geturl())
+    if final.scheme != "https" or final.hostname not in hosts or final.username or final.password:
+        raise ValueError("ChIP-Atlasから予期しない転送先が返されました。")
+
+
+def chip_atlas_metadata(accession):
+    accession = chip_atlas_accession(accession)
+    url = CHIP_ATLAS_METADATA + "?" + urlencode({"expid": accession})
+    try:
+        with urlopen(url, timeout=60) as response:
+            trusted_response(response, CHIP_ATLAS_HOSTS)
+            raw = response.read(2 * 1024**2 + 1)
+    except HTTPError as exc:
+        raise ValueError(f"ChIP-Atlasで{accession}を確認できませんでした（HTTP {exc.code}）。") from exc
+    except URLError as exc:
+        raise ValueError("ChIP-Atlasへ接続できませんでした。しばらく待って再実行してください。") from exc
+    if len(raw) > 2 * 1024**2:
+        raise ValueError("ChIP-Atlasのメタデータ応答が大きすぎます。")
+    try:
+        rows = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise ValueError("ChIP-Atlasのメタデータを読み取れませんでした。") from exc
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("ChIP-Atlasのメタデータ形式が不正です。")
+    rows = [row for row in rows if row.get("expid") == accession]
+    if not rows:
+        raise ValueError(f"{accession}はChIP-Atlasに登録されていません。")
+    return rows
+
+
+def import_chip_atlas_bigwig(store, genomes, accession, genome):
+    accession = chip_atlas_accession(accession)
+    if genome not in GENOME_CATALOG:
+        raise ValueError("ChIP-Atlasと対応する参照ゲノム版を選択してください。")
+    rows = chip_atlas_metadata(accession)
+    available = sorted({str(row.get("genome")) for row in rows if row.get("genome")})
+    metadata = next((row for row in rows if row.get("genome") == genome), None)
+    if metadata is None:
+        versions = "、".join(available) or "なし"
+        raise ValueError(f"{accession}の{genome}版bigWigはありません。ChIP-Atlas上の利用可能な版: {versions}")
+    if metadata.get("agClass") == "Bisulfite-Seq":
+        raise ValueError("Bisulfite-seqはmethylation値とcoverage値が別ファイルです。現在のSRX取得はChIP/ATAC/DNase-seqに対応しています。")
+    key = (accession, genome)
+    with store.lock:
+        cached = store.chip_atlas.get(key)
+        if cached and cached["path"].is_file():
+            return dict(cached["result"])
+    token = uuid.uuid4().hex
+    path = store.directory / (token + ".bw")
+    partial = store.directory / (token + ".bw.part")
+    url = f"{CHIP_ATLAS_DATA}/{genome}/eachData/bw/{accession}.bw"
+    try:
+        try:
+            with urlopen(url, timeout=120) as response, partial.open("wb") as out:
+                trusted_response(response, {"chip-atlas.dbcls.jp"})
+                total = int(response.headers.get("Content-Length", 0)) or None
+                if total is not None and total > MAX_UPLOAD:
+                    raise ValueError("ChIP-AtlasのbigWigが20 GiBを超えています。")
+                downloaded = 0
+                while chunk := response.read(1024**2):
+                    downloaded += len(chunk)
+                    if downloaded > MAX_UPLOAD:
+                        raise ValueError("ChIP-AtlasのbigWigが20 GiBを超えています。")
+                    out.write(chunk)
+                if total is not None and downloaded != total:
+                    raise ValueError("ChIP-AtlasのbigWigダウンロードが中断されました。")
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise ValueError(f"ChIP-Atlasに{accession}の{genome}版bigWigが見つかりません。") from exc
+            raise ValueError(f"ChIP-AtlasからbigWigを取得できませんでした（HTTP {exc.code}）。") from exc
+        except URLError as exc:
+            raise ValueError("ChIP-Atlasへ接続できませんでした。しばらく待って再実行してください。") from exc
+        import pyBigWig
+        with pyBigWig.open(str(partial)) as bw:
+            if not bw.isBigWig():
+                raise ValueError("ChIP-Atlasから取得したファイルがbigWig形式ではありません。")
+            sizes = bw.chroms()
+        reference = genomes.references.get(genome)
+        if reference is not None:
+            mismatched = [chrom for chrom, size in sizes.items()
+                          if chrom not in reference.chroms or reference.chroms[chrom] != size]
+            if mismatched:
+                raise ValueError(f"ChIP-AtlasのbigWigと参照ゲノムの染色体長が一致しません: {mismatched[0]}")
+        partial.replace(path)
+        result = dict(id=token, chroms=sizes, accession=accession, genome=genome,
+                      title=str(metadata.get("title") or ""), antigen=str(metadata.get("agSubClass") or ""),
+                      cell_type=str(metadata.get("clSubClass") or ""), experiment_type=str(metadata.get("agClass") or ""),
+                      source_url=url, bytes=path.stat().st_size)
+        with store.lock:
+            store.bigwigs[token] = path
+            store.chip_atlas[key] = dict(path=path, result=result)
+        return result
+    except Exception:
+        partial.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+        raise
 
 
 def motif_pattern(value):
@@ -129,6 +254,133 @@ class Reference:
         with self.path.open("rb") as inp:
             inp.seek(self.offsets[chrom] + start)
             return inp.read(end - start).decode("ascii")
+
+    @classmethod
+    def restore(cls, path, chroms):
+        if not chroms or any(not isinstance(name, str) or not isinstance(size, int) or size < 1 for name, size in chroms.items()):
+            raise ValueError("参照ゲノムの索引が不正です。")
+        reference = cls.__new__(cls)
+        reference.path = Path(path)
+        reference.chroms = OrderedDict(chroms)
+        reference.offsets = {}
+        offset = 0
+        for name, size in reference.chroms.items():
+            reference.offsets[name] = offset
+            offset += size
+        if reference.path.stat().st_size != offset:
+            raise ValueError("参照ゲノムのサイズが索引と一致しません。")
+        return reference
+
+
+class Genomes:
+    """One persistent, read-only reference per assembly, shared across sessions."""
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.download_lock = threading.Lock()
+        self.references = {}
+        self.entries = {}
+        for assembly, info in GENOME_CATALOG.items():
+            self.entries[assembly] = dict(assembly=assembly, **info, status="available", downloaded=0, total=None)
+            try:
+                folder = self.directory / assembly
+                metadata = json.loads((folder / "metadata.json").read_text())
+                if metadata.get("assembly") != assembly or metadata.get("schema") != 1:
+                    raise ValueError("参照ゲノムの索引が不正です。")
+                self.references[assembly] = Reference.restore(folder / "reference.seq", metadata["chroms"])
+                self.entries[assembly]["status"] = "ready"
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+
+    def catalog(self):
+        with self.lock:
+            return [dict(entry) for entry in self.entries.values()]
+
+    def update(self, assembly, **values):
+        with self.lock:
+            self.entries[assembly].update(values)
+
+    def start(self, assembly):
+        if not isinstance(assembly, str) or assembly not in self.entries:
+            raise ValueError("対応するゲノム版を選択してください。")
+        with self.lock:
+            entry = self.entries[assembly]
+            if entry["status"] in ("available", "error"):
+                entry.update(status="queued", downloaded=0, total=None, error=None)
+                threading.Thread(target=self.worker, args=(assembly,), daemon=True).start()
+            return dict(entry)
+
+    def worker(self, assembly):
+        try:
+            with self.download_lock:
+                self.prepare(assembly)
+        except Exception as exc:
+            self.update(assembly, status="error", error=str(exc))
+            print(f"参照ゲノム {assembly} の準備に失敗: {exc}", flush=True)
+
+    def prepare(self, assembly):
+        if assembly not in GENOME_CATALOG:
+            raise ValueError("対応するゲノム版を選択してください。")
+        if assembly in self.references:
+            return
+        info = GENOME_CATALOG[assembly]
+        folder = self.directory / assembly
+        folder.mkdir(exist_ok=True)
+        filename = assembly + ".fa.gz"
+        archive = folder / filename
+        part = folder / (filename + ".part")
+        self.update(assembly, status="downloading")
+        # Verify against the publisher's checksum before normalizing the FASTA.
+        with urlopen(info["source"] + "md5sum.txt", timeout=60) as response:
+            checksums = response.read(1024 * 1024).decode("ascii")
+        expected = next((fields[0].lower() for line in checksums.splitlines()
+                         if len(fields := line.split()) == 2 and fields[1].lstrip("*") == filename), None)
+        if expected is None or not re.fullmatch(r"[0-9a-f]{32}", expected):
+            raise ValueError("配布元のチェックサムを確認できませんでした。")
+        try:
+            if not archive.exists():
+                with urlopen(info["source"] + filename, timeout=120) as response, part.open("wb") as out:
+                    total = int(response.headers.get("Content-Length", 0)) or None
+                    downloaded = 0
+                    self.update(assembly, total=total)
+                    while chunk := response.read(1024**2):
+                        downloaded += len(chunk)
+                        if downloaded > MAX_UPLOAD:
+                            raise ValueError("参照ゲノムが20 GiBを超えています。")
+                        out.write(chunk)
+                        self.update(assembly, downloaded=downloaded)
+                    if total is not None and downloaded != total:
+                        raise ValueError("参照ゲノムのダウンロードが中断されました。")
+                part.replace(archive)
+            self.update(assembly, status="verifying")
+            digest = hashlib.md5()
+            with archive.open("rb") as inp:
+                for chunk in iter(lambda: inp.read(1024**2), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected:
+                archive.unlink()
+                raise ValueError("参照ゲノムのチェックサムが一致しません。もう一度実行してください。")
+            with urlopen(info["source"] + assembly + ".chrom.sizes", timeout=60) as response:
+                sizes = dict((name, int(size)) for name, size in
+                             (line.split() for line in response.read(1024 * 1024).decode("ascii").splitlines() if line.strip()))
+            self.update(assembly, status="indexing")
+            temporary = folder / "reference.seq.part"
+            reference = Reference(archive, temporary)
+            if reference.chroms != sizes:
+                raise ValueError("参照ゲノムの染色体長が配布元の情報と一致しません。")
+            temporary.replace(folder / "reference.seq")
+            reference.path = folder / "reference.seq"
+            manifest = folder / "metadata.json.part"
+            manifest.write_text(json.dumps(dict(schema=1, assembly=assembly, source=info["source"], md5=expected, chroms=reference.chroms)))
+            manifest.replace(folder / "metadata.json")
+            with self.lock:
+                self.references[assembly] = reference
+                self.entries[assembly].update(status="ready", error=None)
+        finally:
+            part.unlink(missing_ok=True)
+            (folder / "reference.seq.part").unlink(missing_ok=True)
+            (folder / "metadata.json.part").unlink(missing_ok=True)
 
 
 def sequence_bed(reference, rows, motif, both):
@@ -353,6 +605,61 @@ class Store:
         self.references = {}
         self.bigwigs = {}
         self.lock = threading.Lock()
+        self.startup = {}
+        self.last_used = time.monotonic()
+        self.active = 0
+        self.genomes = {}
+        self.chip_atlas = {}
+
+
+class Sessions:
+    """Browser-scoped file stores; active requests keep their files alive."""
+    def __init__(self, directory, shared_store=None, startup=None):
+        self.directory = Path(directory)
+        self.shared_store = shared_store
+        self.startup = startup or {}
+        self.stores = {}
+        self.lock = threading.Lock()
+
+    @contextmanager
+    def acquire(self, cookie_header):
+        cookie = SimpleCookie()
+        try:
+            if len(cookie_header) <= 4096:
+                cookie.load(cookie_header)
+        except CookieError:
+            cookie.clear()
+        value = cookie.get(SESSION_COOKIE)
+        token = value.value if value else None
+        with self.lock:
+            now = time.monotonic()
+            for expired, store in list(self.stores.items()):
+                if not store.active and now - store.last_used >= SESSION_TTL:
+                    shutil.rmtree(store.directory)
+                    del self.stores[expired]
+            store = self.stores.get(token)
+            if store is None:
+                token = secrets.token_hex(32)
+                directory = self.directory / token
+                directory.mkdir()
+                store = Store(directory)
+                # CLI-loaded inputs are intentional shared, read-only templates.
+                # Each browser receives its own file IDs, never another session's.
+                store.startup = copy.deepcopy(self.startup)
+                for key, collection in (("genome", "references"), ("bw", "bigwigs")):
+                    if key in store.startup:
+                        entry = store.startup[key]
+                        new_id = uuid.uuid4().hex
+                        getattr(store, collection)[new_id] = getattr(self.shared_store, collection)[entry["id"]]
+                        entry["id"] = new_id
+                self.stores[token] = store
+            store.active += 1
+        try:
+            yield token, store
+        finally:
+            with self.lock:
+                store.active -= 1
+                store.last_used = time.monotonic()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -361,6 +668,11 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(120)
+
+    def end_headers(self):
+        if getattr(self, "session_token", None):
+            self.send_header("Set-Cookie", f"{SESSION_COOKIE}={self.session_token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}")
+        super().end_headers()
 
     def allowed_host(self):
         """Reject DNS rebinding while keeping localhost / explicit LAN use available."""
@@ -380,13 +692,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if status == 503:
+            self.send_header("Retry-After", "3")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
         if not self.allowed_host():
             return self.send_json(dict(error="このホスト名ではアクセスできません。localhostを使用してください。"), 403)
+        with self.server.sessions.acquire(self.headers.get("Cookie", "")) as (token, store):
+            self.session_token, self.store = token, store
+            return self.get()
+
+    def get(self):
         path = urlsplit(self.path).path
+        if path == "/api/genomes":
+            return self.send_json(dict(genomes=self.server.genomes.catalog(), default="mm10"))
         if path == "/api/health":
             try:
                 import pyBigWig
@@ -394,8 +715,8 @@ class Handler(BaseHTTPRequestHandler):
             except ImportError:
                 available = False
             health = dict(bigwig=available)
-            if getattr(self.server, "startup", None):
-                health["startup"] = self.server.startup
+            if self.store.startup:
+                health["startup"] = self.store.startup
             return self.send_json(health)
         files = {"/": "index.html", "/index.html": "index.html", "/app.js": "app.js", "/core.js": "core.js", "/style.css": "style.css"}
         if path not in files:
@@ -406,6 +727,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime + "; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
@@ -418,6 +740,16 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if (origin and origin != "http://" + self.headers.get("Host", "")) or self.headers.get("Sec-Fetch-Site") == "cross-site":
             return self.send_json(dict(error="別のサイトからのリクエストは受け付けません。"), 403)
+        if not self.server.jobs.acquire(blocking=False):
+            return self.send_json(dict(error="サーバーが混み合っています。少し待ってから再実行してください。"), 503)
+        try:
+            with self.server.sessions.acquire(self.headers.get("Cookie", "")) as (token, store):
+                self.session_token, self.store = token, store
+                return self.post()
+        finally:
+            self.server.jobs.release()
+
+    def post(self):
         try:
             path = urlsplit(self.path).path
             size = int(self.headers.get("Content-Length", "0"))
@@ -451,8 +783,8 @@ class Handler(BaseHTTPRequestHandler):
     def upload(self, route, size):
         token = uuid.uuid4().hex
         suffix = ".gz" if self.headers.get("X-File-Gzip") == "1" else ".input"
-        path = self.server.store.directory / (token + suffix)
-        normalized = self.server.store.directory / (token + ".seq")
+        path = self.store.directory / (token + suffix)
+        normalized = self.store.directory / (token + ".seq")
         try:
             with path.open("wb") as out:
                 remaining = size
@@ -464,8 +796,8 @@ class Handler(BaseHTTPRequestHandler):
                     remaining -= len(chunk)
             if route == "/api/reference":
                 reference = Reference(path, normalized)
-                with self.server.store.lock:
-                    self.server.store.references[token] = reference
+                with self.store.lock:
+                    self.store.references[token] = reference
                 path.unlink()
                 return self.send_json(dict(id=token, chroms=reference.chroms))
             try:
@@ -476,19 +808,35 @@ class Handler(BaseHTTPRequestHandler):
                 if not bw.isBigWig():
                     raise ValueError("bigWig形式のファイルを選択してください。")
                 sizes = bw.chroms()
-            with self.server.store.lock:
-                self.server.store.bigwigs[token] = path
+            with self.store.lock:
+                self.store.bigwigs[token] = path
             return self.send_json(dict(id=token, chroms=sizes))
         except Exception:
-            with self.server.store.lock:
-                self.server.store.references.pop(token, None)
-                self.server.store.bigwigs.pop(token, None)
+            with self.store.lock:
+                self.store.references.pop(token, None)
+                self.store.bigwigs.pop(token, None)
             path.unlink(missing_ok=True)
             normalized.unlink(missing_ok=True)
             raise
 
     def action(self, route, data):
-        store = self.server.store
+        store = self.store
+        if route == "/api/chip-atlas/import":
+            result = import_chip_atlas_bigwig(store, self.server.genomes, data.get("accession"), data.get("genome"))
+            return self.send_json(result)
+        if route == "/api/genomes/select":
+            assembly = data.get("assembly")
+            entry = self.server.genomes.start(assembly)
+            if entry["status"] != "ready":
+                return self.send_json(entry, 202)
+            reference = self.server.genomes.references[assembly]
+            with store.lock:
+                token = store.genomes.get(assembly)
+                if token is None:
+                    token = uuid.uuid4().hex
+                    store.genomes[assembly] = token
+                    store.references[token] = reference
+            return self.send_json(dict(entry, id=token, chroms=reference.chroms))
         if route == "/api/reference/search":
             ref = store.references.get(data.get("id"))
             if ref is None:
@@ -545,17 +893,31 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="ローカル配列・bigWig解析ツール")
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--allowed-host", action="append", default=[], help="接続を許可する追加のホスト名・IP（Docker等で使用、複数指定可）")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--max-jobs", type=int, default=4, help="サーバー側で同時処理する最大リクエスト数（既定: 4）")
     parser.add_argument("--search-genome", type=Path, help="起動時に読み込む検索用参照FASTA")
     parser.add_argument("--query", type=Path, help="起動時に画面へ入力する単一配列FASTA")
     parser.add_argument("--bigwig", type=Path, help="起動時に読み込むbigWig")
+    parser.add_argument("--genome-cache", type=Path, default=ROOT / "genome_cache", help="選択式参照ゲノムの保存先")
+    parser.add_argument("--prepare-genome", action="append", choices=GENOME_CATALOG, help="参照ゲノムを事前取得して終了（複数指定可）")
     args = parser.parse_args()
+    if not 1 <= args.max_jobs <= 32:
+        parser.error("--max-jobsは1〜32で指定してください。")
+    genomes = Genomes(args.genome_cache)
+    if args.prepare_genome:
+        for assembly in args.prepare_genome:
+            genomes.prepare(assembly)
+            print(f"{GENOME_CATALOG[assembly]['name']} の準備ができました。", flush=True)
+        return
     with tempfile.TemporaryDirectory(prefix="motif-workbench-") as directory:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.allowed_hosts = {"localhost", "127.0.0.1", "::1"}
         if args.host not in ("0.0.0.0", "::"):
             server.allowed_hosts.add(args.host.lower())
+        server.allowed_hosts.update(host.lower() for host in args.allowed_host)
         server.store = Store(directory)
+        server.genomes = genomes
         server.startup = {}
         if args.search_genome:
             token = uuid.uuid4().hex
@@ -575,7 +937,10 @@ def main():
                 sizes = bw.chroms()
             server.store.bigwigs[token] = args.bigwig
             server.startup["bw"] = dict(id=token, chroms=sizes, name=args.bigwig.name)
-        print(f"ブラウザで http://localhost:{args.port} を開いてください。終了: Ctrl+C", flush=True)
+        server.sessions = Sessions(directory, server.store, server.startup)
+        server.jobs = threading.BoundedSemaphore(args.max_jobs)
+        display_host = args.host if args.host not in ("0.0.0.0", "::") else "localhost"
+        print(f"ブラウザで http://{display_host}:{args.port} を開いてください。終了: Ctrl+C", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
